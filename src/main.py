@@ -4,14 +4,14 @@ Ingestão no Limite — pipeline dataforma-hub (v2).
 Estratégia (otimizada para 2 GB RAM / 2 CPUs):
   1. Extrai um .EMPRECSV por vez de cada .zip em /data (streaming, disco limitado).
   2. DuckDB lê o CSV bruto (ISO-8859-1 / latin-1, separador ';', sem cabeçalho),
-     aplica TODAS as transformações do contrato + filtros B2B e grava um CSV
+     aplica TODAS as transformações do contrato e grava um CSV
      limpo em UTF-8 — parsing nativo, multithread e out-of-core.
   3. PostgreSQL COPY carrega o CSV limpo na tabela final UNLOGGED (carga mais
      rápida, menos WAL).
 
 Sem dependência de rede em runtime e sem extensões do DuckDB: latin-1 é nativo
-no DuckDB >= 1.2. Todo o contrato de dados é aplicado de forma que as 8 regras
-de Data Quality (DQ-01..DQ-08) retornem 0 erros.
+no DuckDB >= 1.2. Todo o contrato de dados é aplicado de forma que as 13 regras
+de Data Quality (DQ-01..DQ-13) retornem 0 erros.
 """
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ import shutil
 import sys
 import time
 import zipfile
+from datetime import datetime, timezone
 from pathlib import Path
 
 import duckdb
@@ -54,6 +55,11 @@ COLUMNS = (
     "porte_codigo",
     "porte_descricao",
     "ente_federativo",
+    "capital_social_faixa",
+    "is_mei",
+    "natureza_juridica_grupo",
+    "ente_federativo_presente",
+    "data_processamento",
 )
 
 
@@ -69,12 +75,17 @@ def qident(name: str) -> str:
 # SELECT que materializa o contrato de dados a partir das 7 colunas cruas (c0..c6).
 # Observações por coluna:
 #   c0 cnpj_basico            -> exatamente 8 dígitos, zeros à esquerda (DQ-01)
-#   c1 razao_social           -> UPPER + TRIM (DQ-02); filtro MEI-CPF (DQ-08)
+#   c1 razao_social           -> UPPER + TRIM (DQ-02)
 #   c2 natureza_juridica      -> 4 caracteres, zeros à esquerda (DQ-03)
 #   c3 qualificacao_responsavel -> NOT NULL, nunca vazio -> '' (DQ-04)
-#   c4 capital_social         -> vírgula BR -> ponto, DOUBLE, > 1000.00 (DQ-05)
+#   c4 capital_social         -> vírgula BR -> ponto, DOUBLE (DQ-05)
 #   c5 porte_codigo           -> 00/01/03/05 (DQ-06) + descrição oficial (DQ-07)
 #   c6 ente_federativo        -> '' vira NULL
+#   c7 capital_social_faixa   -> derivado de capital_social (DQ-05)
+#   c8 is_mei                  -> true se razao_social termina em 11 dígitos (DQ-08)
+#   c9 natureza_juridica_grupo -> do 1º dígito de natureza_juridica (DQ-11)
+#   c10 ente_federativo_presente -> true se ente_federativo não-nulo (DQ-12)
+#   c11 data_processamento    -> timestamp de ingestão (DQ-13)
 TRANSFORM_SELECT = r"""
 SELECT
     right(lpad(coalesce(c0, ''), 8, '0'), 8)                         AS cnpj_basico,
@@ -89,10 +100,28 @@ SELECT
         WHEN '05' THEN 'DEMAIS'
         ELSE 'NÃO INFORMADO'
     END                                                              AS porte_descricao,
-    nullif(trim(c6), '')                                            AS ente_federativo
+    nullif(trim(c6), '')                                            AS ente_federativo,
+    CASE
+        WHEN try_cast(replace(c4, ',', '.') AS DOUBLE) IS NULL THEN 'SEM CAPITAL'
+        WHEN try_cast(replace(c4, ',', '.') AS DOUBLE) = 0 THEN 'SEM CAPITAL'
+        WHEN try_cast(replace(c4, ',', '.') AS DOUBLE) <= 1000 THEN 'ATÉ 1K'
+        WHEN try_cast(replace(c4, ',', '.') AS DOUBLE) <= 10000 THEN '1K A 10K'
+        WHEN try_cast(replace(c4, ',', '.') AS DOUBLE) <= 100000 THEN '10K A 100K'
+        WHEN try_cast(replace(c4, ',', '.') AS DOUBLE) <= 1000000 THEN '100K A 1M'
+        ELSE 'ACIMA DE 1M'
+    END                                                              AS capital_social_faixa,
+    CASE WHEN regexp_matches(upper(trim(c1)), '[0-9]{11}$') THEN true ELSE false END AS is_mei,
+    CASE left(right(lpad(coalesce(c2, ''), 4, '0'), 4), 1)
+        WHEN '1' THEN 'ADMINISTRAÇÃO PÚBLICA'
+        WHEN '2' THEN 'ENTIDADES EMPRESARIAIS'
+        WHEN '3' THEN 'ENTIDADES SEM FINS LUCRATIVOS'
+        WHEN '4' THEN 'PESSOAS FÍSICAS'
+        WHEN '5' THEN 'ORGANIZAÇÕES INTERNACIONAIS'
+        ELSE 'OUTROS'
+    END                                                              AS natureza_juridica_grupo,
+    CASE WHEN nullif(trim(c6), '') IS NOT NULL THEN true ELSE false END AS ente_federativo_presente,
+    '{ts}'                                                           AS data_processamento
 FROM src
-WHERE try_cast(replace(c4, ',', '.') AS DOUBLE) > 1000.00
-  AND NOT coalesce(regexp_matches(upper(trim(c1)), '[0-9]{11}$'), false)
 """
 
 
@@ -102,23 +131,28 @@ def create_table(cur) -> None:
     cur.execute(
         f"""
         CREATE UNLOGGED TABLE {tbl} (
-            cnpj_basico               VARCHAR(8),
+            cnpj_basico               VARCHAR(8) UNIQUE,
             razao_social              VARCHAR,
             natureza_juridica         VARCHAR(4),
             qualificacao_responsavel  VARCHAR,
             capital_social            DOUBLE PRECISION,
             porte_codigo              VARCHAR(2),
             porte_descricao           VARCHAR,
-            ente_federativo           VARCHAR
+            ente_federativo           VARCHAR,
+            capital_social_faixa      VARCHAR,
+            is_mei                    BOOLEAN,
+            natureza_juridica_grupo   VARCHAR,
+            ente_federativo_presente  BOOLEAN,
+            data_processamento        TIMESTAMP NOT NULL
         );
         """
     )
     log(f"Tabela recriada: {tbl}")
 
 
-def transform_file(raw_path: Path, clean_csv: Path) -> None:
+def transform_file(raw_path: Path, clean_csv: Path, ts: str) -> None:
     """DuckDB: lê o EMPRECSV bruto, aplica contrato + filtros, grava CSV limpo (UTF-8)."""
-    con = duckdb.connect(database=":memory:")
+    con = duckdb.connect(database=":memory")
     try:
         con.execute(f"SET memory_limit='{DUCKDB_MEMORY_LIMIT}';")
         con.execute(f"SET threads={DUCKDB_THREADS};")
@@ -128,6 +162,7 @@ def transform_file(raw_path: Path, clean_csv: Path) -> None:
         raw_sql = raw_path.as_posix().replace("'", "''")
         out_sql = clean_csv.as_posix().replace("'", "''")
 
+        select_qry = TRANSFORM_SELECT.format(ts=ts)
         con.execute(
             f"""
             COPY (
@@ -140,7 +175,7 @@ def transform_file(raw_path: Path, clean_csv: Path) -> None:
                         null_padding=true, ignore_errors=true
                     )
                 )
-                {TRANSFORM_SELECT}
+                {select_qry}
             ) TO '{out_sql}'
             (FORMAT CSV, HEADER false, DELIMITER ',', QUOTE '"', ESCAPE '"', NULL '');
             """
@@ -156,7 +191,9 @@ def copy_into_postgres(cur, clean_csv: Path) -> None:
     # não podem ser nulas; ente_federativo fica de fora para virar NULL quando vazio.
     force_not_null = (
         "cnpj_basico, razao_social, natureza_juridica, "
-        "qualificacao_responsavel, porte_codigo, porte_descricao"
+        "qualificacao_responsavel, porte_codigo, porte_descricao, "
+        "capital_social_faixa, is_mei, natureza_juridica_grupo, "
+        "ente_federativo_presente, data_processamento"
     )
     sql = (
         f"COPY {tbl} ({cols}) FROM STDIN WITH ("
@@ -216,7 +253,8 @@ def main() -> int:
                     shutil.copyfileobj(src, dst, length=1024 * 1024)
 
                 clean_csv = WORK_DIR / "clean.csv"
-                transform_file(raw_path, clean_csv)
+                ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+                transform_file(raw_path, clean_csv, ts)
                 copy_into_postgres(cur, clean_csv)
                 conn.commit()
 
