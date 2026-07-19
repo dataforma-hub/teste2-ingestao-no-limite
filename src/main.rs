@@ -1,13 +1,13 @@
 use chrono::Utc;
-use csv::{ReaderBuilder, StringRecord, WriterBuilder};
+use csv::{ReaderBuilder, WriterBuilder};
 use encoding_rs::WINDOWS_1252;
 use encoding_rs_io::DecodeReaderBytesBuilder;
 use postgres::{Client, NoTls};
 use regex::Regex;
 use std::env;
 use std::fs::File;
-use std::io::{self, BufReader, Write};
-use std::path::{Path, PathBuf};
+use std::io::Write;
+use std::path::Path;
 use std::time::Instant;
 use zip::ZipArchive;
 
@@ -65,6 +65,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );", tbl
     ), &[])?;
     
+    let tmp_tbl = format!("public.\"tmp_{}\"", pg_table.replace("\"", "\"\""));
+    client.execute(&format!("DROP TABLE IF EXISTS {};", tmp_tbl), &[])?;
+    client.execute(&format!(
+        "CREATE UNLOGGED TABLE {} (
+            cnpj_basico               VARCHAR(8),
+            razao_social              VARCHAR,
+            natureza_juridica         VARCHAR(4),
+            qualificacao_responsavel  VARCHAR,
+            capital_social            DOUBLE PRECISION,
+            porte_codigo              VARCHAR(2),
+            porte_descricao           VARCHAR,
+            ente_federativo           VARCHAR,
+            capital_social_faixa      VARCHAR,
+            is_mei                    BOOLEAN,
+            natureza_juridica_grupo   VARCHAR,
+            ente_federativo_presente  BOOLEAN,
+            data_processamento        TIMESTAMP NOT NULL
+        );", tmp_tbl
+    ), &[])?;
+    
     let is_mei_re = Regex::new(r"[0-9]{11}$").unwrap();
     let force_not_null = "cnpj_basico, razao_social, natureza_juridica, qualificacao_responsavel, porte_codigo, porte_descricao, capital_social_faixa, is_mei, natureza_juridica_grupo, ente_federativo_presente, data_processamento";
     
@@ -75,7 +95,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut archive = ZipArchive::new(file)?;
         
         for i in 0..archive.len() {
-            let mut zip_file = archive.by_index(i)?;
+            let zip_file = archive.by_index(i)?;
             let name = zip_file.name().to_string().to_uppercase();
             if name.ends_with('/') || !name.contains("EMPRE") {
                 continue;
@@ -94,7 +114,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .has_headers(false)
                 .from_reader(decoded);
                 
-            let sql = format!("COPY {} (cnpj_basico, razao_social, natureza_juridica, qualificacao_responsavel, capital_social, porte_codigo, porte_descricao, ente_federativo, capital_social_faixa, is_mei, natureza_juridica_grupo, ente_federativo_presente, data_processamento) FROM STDIN WITH (FORMAT csv, DELIMITER ',', QUOTE '\"', ESCAPE '\"', NULL '', FORCE_NOT_NULL ({}))", tbl, force_not_null);
+            let sql = format!("COPY {} (cnpj_basico, razao_social, natureza_juridica, qualificacao_responsavel, capital_social, porte_codigo, porte_descricao, ente_federativo, capital_social_faixa, is_mei, natureza_juridica_grupo, ente_federativo_presente, data_processamento) FROM STDIN WITH (FORMAT csv, DELIMITER ',', QUOTE '\"', ESCAPE '\"', NULL '', FORCE_NOT_NULL ({}))", tmp_tbl, force_not_null);
             
             let mut writer = client.copy_in(&sql)?;
             let mut csv_writer = WriterBuilder::new()
@@ -199,6 +219,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             
             writer.finish()?;
+            
+            client.execute(&format!("
+                INSERT INTO {} 
+                SELECT * FROM {} 
+                ON CONFLICT (cnpj_basico) DO NOTHING;
+            ", tbl, tmp_tbl), &[])?;
+            
+            client.execute(&format!("TRUNCATE {};", tmp_tbl), &[])?;
+            
             processed += 1;
             println!("[ingestao] [{}:{}] carregado em {:.1}s", zip_path.display(), name, t0.elapsed().as_secs_f64());
         }
