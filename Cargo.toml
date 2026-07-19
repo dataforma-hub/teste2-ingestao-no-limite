@@ -10,4 +10,9 @@ csv = "1.3"
 encoding_rs = "0.8"
 encoding_rs_io = "0.1.7"
 chrono = "0.4"
-regex = "1.10"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = 3
+panic = "abort"
