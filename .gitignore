@@ -8,3 +8,7 @@
 # Legado Python
 __pycache__/
 *.py[cod]
+
+src/smoke_test.rs
+
+smoke_test.sh
