@@ -1,3 +1,0 @@
-# latin-1 nativo no read_csv exige DuckDB >= 1.2
-duckdb>=1.2,<2
-psycopg2-binary>=2.9,<3

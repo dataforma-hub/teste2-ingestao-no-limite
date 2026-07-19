@@ -1,1 +1,10 @@
-src/__pycache__
+# Rust build artifacts
+/target/
+**/*.rs.bk
+
+# Documentação do desafio
+*.md
+
+# Legado Python
+__pycache__/
+*.py[cod]
