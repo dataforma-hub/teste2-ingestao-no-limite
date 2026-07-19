@@ -219,27 +219,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             
             writer.finish()?;
-            
-            client.execute(&format!("
-                INSERT INTO {} 
-                SELECT * FROM {} 
-                ON CONFLICT (cnpj_basico) DO NOTHING;
-            ", tbl, tmp_tbl), &[])?;
-            
+
+            // Dedup within the batch (DISTINCT ON) and across files (ON CONFLICT).
+            // Source zips can repeat cnpj_basico; DQ-09 requires uniqueness.
+            let inserted = client.execute(
+                &format!(
+                    "INSERT INTO {tbl}
+                     SELECT DISTINCT ON (cnpj_basico) *
+                     FROM {tmp_tbl}
+                     ORDER BY cnpj_basico
+                     ON CONFLICT (cnpj_basico) DO NOTHING;"
+                ),
+                &[],
+            )?;
+
             client.execute(&format!("TRUNCATE {};", tmp_tbl), &[])?;
-            
+
             processed += 1;
-            println!("[ingestao] [{}:{}] carregado em {:.1}s", zip_path.display(), name, t0.elapsed().as_secs_f64());
+            println!(
+                "[ingestao] [{}:{}] carregado em {:.1}s ({} novos)",
+                zip_path.display(),
+                name,
+                t0.elapsed().as_secs_f64(),
+                inserted
+            );
         }
     }
-    
+
+    client.execute(&format!("DROP TABLE IF EXISTS {};", tmp_tbl), &[])?;
+
     if processed == 0 {
         println!("[ingestao] ERRO: nenhum arquivo EMPRECSV encontrado dentro dos zips.");
         return Ok(());
     }
-    
-    let count: i64 = client.query_one(&format!("SELECT count(*) FROM {};", tbl), &[])?.get(0);
-    println!("[ingestao] Concluído: {} arquivo(s), {} registros em {:.1}s", processed, count, started.elapsed().as_secs_f64());
-    
+
+    let count: i64 = client
+        .query_one(&format!("SELECT count(*) FROM {};", tbl), &[])?
+        .get(0);
+    println!(
+        "[ingestao] Concluído: {} arquivo(s), {} registros em {:.1}s",
+        processed,
+        count,
+        started.elapsed().as_secs_f64()
+    );
+
     Ok(())
 }
