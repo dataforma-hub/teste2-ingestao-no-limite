@@ -1,16 +1,18 @@
 use chrono::Utc;
-use csv::{ReaderBuilder, StringRecord, WriterBuilder};
+use csv::{ReaderBuilder, ByteRecord};
 use encoding_rs::WINDOWS_1252;
 use encoding_rs_io::DecodeReaderBytesBuilder;
 use postgres::{Client, NoTls};
 use std::env;
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::Write;
 use std::path::Path;
 use std::time::Instant;
+use std::thread;
 use zip::ZipArchive;
+use crossbeam_channel::bounded;
+use ryu;
 
-/// Bitset for CNPJ básico (8 digits → 0..99_999_999). ~12.5 MiB.
 struct CnpjBitset {
     words: Vec<u64>,
 }
@@ -22,7 +24,6 @@ impl CnpjBitset {
         }
     }
 
-    /// Returns true if the CNPJ was already present.
     fn insert(&mut self, cnpj: u32) -> bool {
         let idx = cnpj as usize;
         let word = idx / 64;
@@ -33,53 +34,112 @@ impl CnpjBitset {
     }
 }
 
-fn pad_digits(raw: &str, width: usize) -> String {
-    let bytes = raw.as_bytes();
-    if bytes.len() == width {
-        return raw.to_string();
+fn pad_digits_bytes(raw: &[u8], width: usize, out: &mut Vec<u8>) {
+    out.clear();
+    if raw.len() == width {
+        out.extend_from_slice(raw);
+    } else if raw.len() > width {
+        out.extend_from_slice(&raw[raw.len() - width..]);
+    } else {
+        for _ in 0..(width - raw.len()) {
+            out.push(b'0');
+        }
+        out.extend_from_slice(raw);
     }
-    if bytes.len() > width {
-        return raw[raw.len() - width..].to_string();
-    }
-    let mut out = String::with_capacity(width);
-    for _ in 0..(width - bytes.len()) {
-        out.push('0');
-    }
-    out.push_str(raw);
-    out
 }
 
-fn parse_cnpj_u32(cnpj: &str) -> Option<u32> {
-    if cnpj.len() == 8 && cnpj.bytes().all(|b| b.is_ascii_digit()) {
-        cnpj.parse().ok()
+fn parse_cnpj_u32(cnpj: &[u8]) -> Option<u32> {
+    if cnpj.len() == 8 && cnpj.iter().all(|&b| b.is_ascii_digit()) {
+        let mut v = 0;
+        for &b in cnpj {
+            v = v * 10 + (b - b'0') as u32;
+        }
+        Some(v)
     } else {
         None
     }
 }
 
-fn is_mei(razao: &str) -> bool {
-    let b = razao.as_bytes();
-    b.len() >= 11 && b[b.len() - 11..].iter().all(|c| c.is_ascii_digit())
+fn is_mei(razao: &[u8]) -> bool {
+    let b = razao;
+    b.len() >= 11 && b[b.len() - 11..].iter().all(|&c| c.is_ascii_digit())
 }
 
-fn parse_capital(raw: &str) -> Option<f64> {
+fn parse_capital_f64(raw: &[u8]) -> Option<f64> {
     if raw.is_empty() {
         return None;
     }
-    if !raw.as_bytes().contains(&b',') {
-        return raw.parse().ok();
-    }
     let mut buf = [0u8; 64];
-    let bytes = raw.as_bytes();
-    if bytes.len() > buf.len() {
-        return raw.replace(',', ".").parse().ok();
+    if raw.len() > buf.len() {
+        return None;
     }
-    for (i, &b) in bytes.iter().enumerate() {
-        buf[i] = if b == b',' { b'.' } else { b };
+    let mut i = 0;
+    for &b in raw {
+        if b == b',' {
+            buf[i] = b'.';
+        } else {
+            buf[i] = b;
+        }
+        i += 1;
     }
-    std::str::from_utf8(&buf[..bytes.len()])
+    std::str::from_utf8(&buf[..i])
         .ok()
         .and_then(|s| s.parse().ok())
+}
+
+fn trim_bytes(mut raw: &[u8]) -> &[u8] {
+    while let Some(&b) = raw.first() {
+        if b.is_ascii_whitespace() {
+            raw = &raw[1..];
+        } else {
+            break;
+        }
+    }
+    while let Some(&b) = raw.last() {
+        if b.is_ascii_whitespace() {
+            raw = &raw[..raw.len() - 1];
+        } else {
+            break;
+        }
+    }
+    raw
+}
+
+fn write_utf8_upper(raw: &[u8], out: &mut Vec<u8>) {
+    out.clear();
+    let trimmed = trim_bytes(raw);
+    if let Ok(s) = std::str::from_utf8(trimmed) {
+        for c in s.chars() {
+            for uc in c.to_uppercase() {
+                let mut buf = [0u8; 4];
+                out.extend_from_slice(uc.encode_utf8(&mut buf).as_bytes());
+            }
+        }
+    } else {
+        out.extend_from_slice(trimmed);
+    }
+}
+
+fn write_csv_field(val: &[u8], out: &mut Vec<u8>) {
+    let needs_quotes = val.contains(&b',') || val.contains(&b'"') || val.contains(&b'\n');
+    if !needs_quotes {
+        out.extend_from_slice(val);
+    } else {
+        out.push(b'"');
+        for &b in val {
+            if b == b'"' {
+                out.push(b'"');
+                out.push(b'"');
+            } else {
+                out.push(b);
+            }
+        }
+        out.push(b'"');
+    }
+}
+
+fn write_csv_field_str(val: &str, out: &mut Vec<u8>) {
+    write_csv_field(val.as_bytes(), out);
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -127,7 +187,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
 
     let tbl = format!("public.\"{}\"", pg_table.replace('"', "\"\""));
-    // No UNIQUE during load — bitset dedupes in-stream (DQ-09). Index would kill COPY speed.
     client.execute(&format!("DROP TABLE IF EXISTS {};", tbl), &[])?;
     client.execute(
         &format!(
@@ -157,6 +216,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         tbl, force_not_null
     );
 
+    let (tx, rx) = bounded::<Vec<u8>>(100);
+
+    let worker = thread::spawn(move || -> Result<u64, String> {
+        let mut client = Client::connect(&conn_str, NoTls).map_err(|e| e.to_string())?;
+        let mut copy_writer = client.copy_in(&copy_sql).map_err(|e| e.to_string())?;
+        let mut total_kept = 0u64;
+        for chunk in rx {
+            copy_writer.write_all(&chunk).map_err(|e| e.to_string())?;
+        }
+        copy_writer.finish().map_err(|e| e.to_string())?;
+        Ok(total_kept)
+    });
+
     let mut seen = CnpjBitset::new();
     let mut processed = 0u32;
     let mut total_kept = 0u64;
@@ -167,7 +239,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut archive = ZipArchive::new(file)?;
 
         for i in 0..archive.len() {
-            let zip_file = archive.by_index(i)?;
+            let mut zip_file = archive.by_index(i)?;
             let name = zip_file.name().to_string().to_uppercase();
             if name.ends_with('/') || !name.contains("EMPRE") {
                 continue;
@@ -175,6 +247,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let t0 = Instant::now();
             let ts = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+            let ts_bytes = ts.as_bytes();
 
             let decoded = DecodeReaderBytesBuilder::new()
                 .encoding(Some(WINDOWS_1252))
@@ -187,103 +260,112 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .flexible(true)
                 .from_reader(decoded);
 
-            let mut copy_writer = client.copy_in(&copy_sql)?;
             let mut kept = 0u64;
             let mut skipped = 0u64;
-            {
-                let mut buffered = BufWriter::with_capacity(8 * 1024 * 1024, &mut copy_writer);
-                {
-                    let mut csv_writer = WriterBuilder::new()
-                        .delimiter(b',')
-                        .quote(b'"')
-                        .from_writer(&mut buffered);
 
-                    let mut record = StringRecord::new();
-                    loop {
-                        match rdr.read_record(&mut record) {
-                            Ok(true) => {}
-                            Ok(false) => break,
-                            Err(_) => continue,
-                        }
+            let mut record = ByteRecord::new();
+            let mut out_buffer = Vec::with_capacity(2 * 1024 * 1024);
 
-                        let cnpj_basico = pad_digits(record.get(0).unwrap_or(""), 8);
-                        if let Some(key) = parse_cnpj_u32(&cnpj_basico) {
-                            if seen.insert(key) {
-                                skipped += 1;
-                                continue;
-                            }
-                        }
+            let mut buf_cnpj = Vec::new();
+            let mut buf_razao = Vec::new();
+            let mut buf_natureza = Vec::new();
 
-                        let razao_social = record.get(1).unwrap_or("").trim().to_uppercase();
-                        let natureza_juridica = pad_digits(record.get(2).unwrap_or(""), 4);
-                        let qualificacao_responsavel = record.get(3).unwrap_or("").trim();
-
-                        let capital_f64 = parse_capital(record.get(4).unwrap_or(""));
-
-                        let porte_raw = record.get(5).unwrap_or("");
-                        let porte_codigo = match porte_raw {
-                            "01" | "03" | "05" | "00" => porte_raw,
-                            _ => "00",
-                        };
-
-                        let porte_descricao = match porte_codigo {
-                            "01" => "MICRO EMPRESA",
-                            "03" => "EMPRESA DE PEQUENO PORTE",
-                            "05" => "DEMAIS",
-                            _ => "NÃO INFORMADO",
-                        };
-
-                        let ente_federativo = record.get(6).unwrap_or("").trim();
-                        let ente_federativo_presente = !ente_federativo.is_empty();
-
-                        let capital_social_faixa = match capital_f64 {
-                            None => "SEM CAPITAL",
-                            Some(v) if v == 0.0 => "SEM CAPITAL",
-                            Some(v) if v <= 1000.0 => "ATÉ 1K",
-                            Some(v) if v <= 10000.0 => "1K A 10K",
-                            Some(v) if v <= 100000.0 => "10K A 100K",
-                            Some(v) if v <= 1000000.0 => "100K A 1M",
-                            _ => "ACIMA DE 1M",
-                        };
-
-                        let is_mei_flag = is_mei(&razao_social);
-
-                        let natureza_juridica_grupo =
-                            match natureza_juridica.as_bytes().first().copied().unwrap_or(b' ') {
-                                b'1' => "ADMINISTRAÇÃO PÚBLICA",
-                                b'2' => "ENTIDADES EMPRESARIAIS",
-                                b'3' => "ENTIDADES SEM FINS LUCRATIVOS",
-                                b'4' => "PESSOAS FÍSICAS",
-                                b'5' => "ORGANIZAÇÕES INTERNACIONAIS",
-                                _ => "OUTROS",
-                            };
-
-                        let capital_str = capital_f64.map(|v| v.to_string()).unwrap_or_default();
-                        let is_mei_str = if is_mei_flag { "t" } else { "f" };
-                        let ente_presente_str = if ente_federativo_presente { "t" } else { "f" };
-
-                        csv_writer.write_record(&[
-                            cnpj_basico.as_str(),
-                            razao_social.as_str(),
-                            natureza_juridica.as_str(),
-                            qualificacao_responsavel,
-                            capital_str.as_str(),
-                            porte_codigo,
-                            porte_descricao,
-                            ente_federativo,
-                            capital_social_faixa,
-                            is_mei_str,
-                            natureza_juridica_grupo,
-                            ente_presente_str,
-                            ts.as_str(),
-                        ])?;
-                        kept += 1;
-                    }
-                    csv_writer.flush()?;
+            loop {
+                match rdr.read_byte_record(&mut record) {
+                    Ok(true) => {}
+                    Ok(false) => break,
+                    Err(_) => continue,
                 }
-                buffered.flush()?;
+
+                let cnpj_raw = record.get(0).unwrap_or(b"");
+                pad_digits_bytes(cnpj_raw, 8, &mut buf_cnpj);
+
+                if let Some(key) = parse_cnpj_u32(&buf_cnpj) {
+                    if seen.insert(key) {
+                        skipped += 1;
+                        continue;
+                    }
+                }
+
+                let razao_raw = record.get(1).unwrap_or(b"");
+                write_utf8_upper(razao_raw, &mut buf_razao);
+
+                let natureza_raw = record.get(2).unwrap_or(b"");
+                pad_digits_bytes(natureza_raw, 4, &mut buf_natureza);
+
+                let qualif_raw = record.get(3).unwrap_or(b"");
+                let qualif_trimmed = trim_bytes(qualif_raw);
+
+                let capital_raw = record.get(4).unwrap_or(b"");
+                let capital_f64 = parse_capital_f64(capital_raw);
+
+                let porte_raw = record.get(5).unwrap_or(b"");
+                let porte_codigo = match porte_raw {
+                    b"01" | b"03" | b"05" | b"00" => porte_raw,
+                    _ => b"00",
+                };
+                let porte_descricao = match porte_codigo {
+                    b"01" => "MICRO EMPRESA",
+                    b"03" => "EMPRESA DE PEQUENO PORTE",
+                    b"05" => "DEMAIS",
+                    _ => "NÃO INFORMADO",
+                };
+
+                let ente_raw = record.get(6).unwrap_or(b"");
+                let ente_trimmed = trim_bytes(ente_raw);
+                let ente_federativo_presente = !ente_trimmed.is_empty();
+
+                let capital_social_faixa = match capital_f64 {
+                    None => "SEM CAPITAL",
+                    Some(v) if v == 0.0 => "SEM CAPITAL",
+                    Some(v) if v <= 1000.0 => "ATÉ 1K",
+                    Some(v) if v <= 10000.0 => "1K A 10K",
+                    Some(v) if v <= 100000.0 => "10K A 100K",
+                    Some(v) if v <= 1000000.0 => "100K A 1M",
+                    _ => "ACIMA DE 1M",
+                };
+
+                let is_mei_flag = is_mei(&buf_razao);
+
+                let nat_first = buf_natureza.first().copied().unwrap_or(b' ');
+                let natureza_juridica_grupo = match nat_first {
+                    b'1' => "ADMINISTRAÇÃO PÚBLICA",
+                    b'2' => "ENTIDADES EMPRESARIAIS",
+                    b'3' => "ENTIDADES SEM FINS LUCRATIVOS",
+                    b'4' => "PESSOAS FÍSICAS",
+                    b'5' => "ORGANIZAÇÕES INTERNACIONAIS",
+                    _ => "OUTROS",
+                };
+
+                write_csv_field(&buf_cnpj, &mut out_buffer); out_buffer.push(b',');
+                write_csv_field(&buf_razao, &mut out_buffer); out_buffer.push(b',');
+                write_csv_field(&buf_natureza, &mut out_buffer); out_buffer.push(b',');
+                write_csv_field(qualif_trimmed, &mut out_buffer); out_buffer.push(b',');
+                if let Some(v) = capital_f64 {
+                    let mut s = ryu::Buffer::new();
+                    out_buffer.extend_from_slice(s.format(v).as_bytes());
+                }
+                out_buffer.push(b',');
+                write_csv_field(porte_codigo, &mut out_buffer); out_buffer.push(b',');
+                write_csv_field_str(porte_descricao, &mut out_buffer); out_buffer.push(b',');
+                write_csv_field(ente_trimmed, &mut out_buffer); out_buffer.push(b',');
+                write_csv_field_str(capital_social_faixa, &mut out_buffer); out_buffer.push(b',');
+                out_buffer.extend_from_slice(if is_mei_flag { b"t," } else { b"f," });
+                write_csv_field_str(natureza_juridica_grupo, &mut out_buffer); out_buffer.push(b',');
+                out_buffer.extend_from_slice(if ente_federativo_presente { b"t," } else { b"f," });
+                out_buffer.extend_from_slice(ts_bytes); out_buffer.push(b'\n');
+
+                kept += 1;
+
+                if out_buffer.len() >= 1024 * 1024 {
+                    tx.send(out_buffer).unwrap();
+                    out_buffer = Vec::with_capacity(2 * 1024 * 1024);
+                }
             }
-            copy_writer.finish()?;
+
+            if !out_buffer.is_empty() {
+                tx.send(out_buffer).unwrap();
+            }
 
             total_kept += kept;
             total_skipped += skipped;
@@ -306,6 +388,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    drop(tx);
+    worker.join().unwrap().unwrap();
+
     if processed == 0 {
         println!("[ingestao] ERRO: nenhum arquivo EMPRECSV encontrado dentro dos zips.");
         return Ok(());
@@ -321,7 +406,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         total_skipped,
         started.elapsed().as_secs_f64()
     );
-    let _ = total_kept;
 
     Ok(())
 }
