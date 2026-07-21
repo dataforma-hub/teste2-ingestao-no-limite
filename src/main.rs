@@ -3,10 +3,12 @@ use csv::{ReaderBuilder, ByteRecord};
 use encoding_rs::WINDOWS_1252;
 use encoding_rs_io::DecodeReaderBytesBuilder;
 use postgres::{Client, NoTls};
+use rayon::prelude::*;
 use std::env;
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use std::thread;
 use zip::ZipArchive;
@@ -221,7 +223,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let worker = thread::spawn(move || -> Result<u64, String> {
         let mut client = Client::connect(&conn_str, NoTls).map_err(|e| e.to_string())?;
         let mut copy_writer = client.copy_in(&copy_sql).map_err(|e| e.to_string())?;
-        let mut total_kept = 0u64;
+        let total_kept = 0u64;
         for chunk in rx {
             copy_writer.write_all(&chunk).map_err(|e| e.to_string())?;
         }
@@ -229,17 +231,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(total_kept)
     });
 
-    let mut seen = CnpjBitset::new();
-    let mut processed = 0u32;
-    let mut total_kept = 0u64;
-    let mut total_skipped = 0u64;
+    let seen = Arc::new(Mutex::new(CnpjBitset::new()));
+    let total_skipped = Arc::new(Mutex::new(0u64));
+    let total_kept = Arc::new(Mutex::new(0u64));
+    let processed = Arc::new(Mutex::new(0u32));
 
-    for zip_path in &entries {
-        let file = File::open(zip_path)?;
-        let mut archive = ZipArchive::new(file)?;
+    entries.par_iter().for_each(|zip_path| {
+        let file = File::open(zip_path).expect("failed to open zip");
+        let mut archive = ZipArchive::new(file).expect("failed to read zip archive");
 
         for i in 0..archive.len() {
-            let mut zip_file = archive.by_index(i)?;
+            let zip_file = archive.by_index(i).expect("failed to read zip entry");
             let name = zip_file.name().to_string().to_uppercase();
             if name.ends_with('/') || !name.contains("EMPRE") {
                 continue;
@@ -281,7 +283,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 pad_digits_bytes(cnpj_raw, 8, &mut buf_cnpj);
 
                 if let Some(key) = parse_cnpj_u32(&buf_cnpj) {
-                    if seen.insert(key) {
+                    if seen.lock().unwrap().insert(key) {
                         skipped += 1;
                         continue;
                     }
@@ -367,9 +369,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tx.send(out_buffer).unwrap();
             }
 
-            total_kept += kept;
-            total_skipped += skipped;
-            processed += 1;
+            *total_kept.lock().unwrap() += kept;
+            *total_skipped.lock().unwrap() += skipped;
+            *processed.lock().unwrap() += 1;
             let elapsed = t0.elapsed().as_secs_f64();
             let rate = if elapsed > 0.0 {
                 kept as f64 / elapsed
@@ -386,10 +388,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 skipped
             );
         }
-    }
+    });
 
     drop(tx);
     worker.join().unwrap().unwrap();
+
+    let processed = *processed.lock().unwrap();
+    let total_skipped = *total_skipped.lock().unwrap();
 
     if processed == 0 {
         println!("[ingestao] ERRO: nenhum arquivo EMPRECSV encontrado dentro dos zips.");
