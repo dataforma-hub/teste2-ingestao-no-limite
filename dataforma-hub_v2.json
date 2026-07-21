@@ -1,6 +1,6 @@
 {
-    "participante": "dataforma-hub_v2",
-    "repositorio": "https://github.com/dataforma-hub/teste2-ingestao-no-limite",
-    "email": "contato.dataforma@outlook.com"
-  }
-  
+  "participante": "dataforma-hub_v2",
+  "repositorio": "https://github.com/dataforma-hub/teste2-ingestao-no-limite",
+  "email": "contato.dataforma@outlook.com",
+  "stack": "Rust + PostgreSQL + Docker"
+}
